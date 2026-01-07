@@ -1,3 +1,5 @@
+use linked_hash_map::LinkedHashMap;
+use std::hash::Hash;
 use pyo3::{
     intern,
     sync::GILOnceCell,
@@ -41,4 +43,22 @@ pub fn torch_empty<'py>(
                 &vec![(intern!(py, "dtype"), dtype)].into_pyobject(py)?,
             )?),
         )?)
+}
+
+pub struct PyLinkedHashMap<K, V>(pub LinkedHashMap<K, V>);
+
+impl<'py, K, V> pyo3::conversion::FromPyObject<'py> for PyLinkedHashMap<K, V>
+where
+    K: Eq + Hash + pyo3::conversion::FromPyObject<'py>,
+    V: pyo3::conversion::FromPyObject<'py>,
+{
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        let py = ob.py();
+        let dict = ob.downcast::<PyDict>()?;
+        let items = dict.call_method0(intern!(py, "items"))?;
+        let list_builtin = py.import("builtins")?.getattr("list")?;
+        let items_list = list_builtin.call1((items,))?;
+        let kv_list: Vec<(K, V)> = items_list.extract()?;
+        Ok(PyLinkedHashMap(kv_list.into_iter().collect()))
+    }
 }
