@@ -1,4 +1,4 @@
-use linked_hash_map::LinkedHashMap;
+use std::collections::HashMap;
 
 use itertools::Itertools;
 use pyo3::exceptions::PyAssertionError;
@@ -7,7 +7,7 @@ use pyo3::{intern, prelude::*};
 use pyo3::{IntoPyObjectExt, PyObject};
 
 use crate::env_action::{EnvAction, EnvActionResponse};
-use crate::misc::{tensor_slice_1d, torch_empty, PyLinkedHashMap};
+use crate::misc::{tensor_slice_1d, torch_empty};
 
 fn get_actions<'py>(
     agent_controller: &Bound<'py, PyAny>,
@@ -36,28 +36,14 @@ fn choose_agents<'py>(
 
 fn choose_env_actions<'py>(
     agent_controller: &Bound<'py, PyAny>,
-    state_info: &LinkedHashMap<String, PyObject>,
-) -> PyResult<LinkedHashMap<String, PyObject>> {
-    let py = agent_controller.py();
-    // Convert LinkedHashMap -> PyDict while preserving insertion order
-    let state_info_pydict = PyDict::from_sequence(
-        &state_info
-            .iter()
-            .collect::<Vec<_>>()
-            .into_pyobject(py)?,
-    )?;
-
-    // Call Python choose_env_actions and convert resulting dict back into a LinkedHashMap
-    let py_result = agent_controller.call_method1(
-        intern!(py, "choose_env_actions"),
-        (state_info_pydict,),
-    )?;
-    let dict = py_result.downcast::<PyDict>()?;
-    let items = dict.call_method0(intern!(py, "items"))?;
-    let list_builtin = py.import("builtins")?.getattr("list")?;
-    let items_list = list_builtin.call1((items,))?;
-    let kv_list: Vec<(String, PyObject)> = items_list.extract()?;
-    Ok(kv_list.into_iter().collect())
+    state_info: &HashMap<String, PyObject>,
+) -> PyResult<HashMap<String, Bound<'py, PyAny>>> {
+    Ok(agent_controller
+        .call_method1(
+            intern!(agent_controller.py(), "choose_env_actions"),
+            (state_info,),
+        )?
+        .extract()?)
 }
 
 fn process_env_actions<'py>(
@@ -231,39 +217,20 @@ impl AgentManager {
 
     pub fn get_env_actions(
         &self,
-        mut env_obs_data_dict: PyLinkedHashMap<String, (Vec<PyObject>, Vec<PyObject>)>,
-        state_info: PyLinkedHashMap<String, PyObject>,
+        mut env_obs_data_dict: HashMap<String, (Vec<PyObject>, Vec<PyObject>)>,
+        state_info: HashMap<String, PyObject>,
     ) -> PyResult<Py<PyDict>> {
         Python::with_gil::<_, PyResult<Py<PyDict>>>(|py| {
             // Get env action responses from agent controllers
-            let mut env_obs_data_dict = env_obs_data_dict.0;
-            let mut state_info = state_info.0;
-            let mut env_action_responses: LinkedHashMap<String, PyObject> =
-                LinkedHashMap::with_capacity(state_info.len());
+            let mut state_info = state_info;
+            let mut env_action_responses = HashMap::with_capacity(state_info.len());
             for py_agent_controller in self.agent_controllers.iter() {
                 let agent_controller = py_agent_controller.bind(py);
-                let agent_controller_env_action_responses =
+                let mut agent_controller_env_action_responses =
                     choose_env_actions(agent_controller, &state_info)?;
-
-                // Keep only non-None responses, and only for env ids which don't yet
-                // have an env action response (earlier agent controllers take priority).
-                for (env_id, response) in agent_controller_env_action_responses.into_iter() {
-                    if !response.is_none(py) && !env_action_responses.contains_key(&env_id) {
-                        env_action_responses.insert(env_id, response);
-                    }
-                }
-
-                // Remove envs which already have an env action response from state_info
-                if !env_action_responses.is_empty() {
-                    let mut new_state_info = LinkedHashMap::with_capacity(state_info.len());
-                    for (env_id, info) in state_info.into_iter() {
-                        if !env_action_responses.contains_key(&env_id) {
-                            new_state_info.insert(env_id, info);
-                        }
-                    }
-                    state_info = new_state_info;
-                }
-
+                agent_controller_env_action_responses.retain(|_, v| !v.is_none());
+                env_action_responses.extend(agent_controller_env_action_responses.drain());
+                state_info.retain(|env_id, _| !env_action_responses.contains_key(env_id));
                 if state_info.is_empty() {
                     break;
                 }
@@ -294,7 +261,7 @@ impl AgentManager {
             let mut total_len = 0;
             let mut should_get_actions = false;
             for (env_id, env_action_response) in env_action_responses.into_iter() {
-                match env_action_response.extract::<EnvActionResponse>(py)? {
+                match env_action_response.extract::<EnvActionResponse>()? {
                     EnvActionResponse::STEP {
                         shared_info_setter,
                         send_state,
